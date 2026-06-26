@@ -1,0 +1,108 @@
+# 此工作流完全模仿本地 wubuntu 实体机运行逻辑
+# 一次性集齐全格式虚拟磁盘（VMDK/VDI/QCOW2/IMG）打包所需的全部底层依赖，拒绝半路崩溃
+name: Build 25.12.x IMG.GZ x86-64
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: '请输入要编译固件大小 单位(MB)'
+        required: true
+        default: '2048'
+      include_docker:
+        description: "是否编译 Docker 插件"
+        required: true
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+
+permissions:
+  contents: write
+
+jobs:
+  build_immortalwrt:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ 一次性安装全格式打包依赖全家桶 (彻底焊死依赖漏洞)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential libncurses5-dev libncursesw5-dev zlib1g-dev \
+            gawk git gettext libssl-dev xz-utils patch unzip subversion flex bison \
+            python3 python3-pip wget zstd \
+            qemu-utils genisoimage mtools dosfstools bzip2 gzip e2fsprogs util-linux
+
+      - name: ⏬ 官仓直供：使用直接链接下载新版 Zst 编译器
+        run: |
+          mkdir -p /home/runner/immortalwrt_build
+          cd /home/runner/immortalwrt_build
+          
+          URL="https://downloads.immortalwrt.org/releases/25.12.0/targets/x86/64/immortalwrt-imagebuilder-25.12.0-x86-64.Linux-x86_64.tar.zst"
+          
+          echo "📥 正在通过直接链接下载官仓 Zst 编译器..."
+          wget -q --show-progress "$URL"
+          
+          echo "📦 正在使用 zstd 强力解压..."
+          tar -I zstd -xf "immortalwrt-imagebuilder-25.12.0-x86-64.Linux-x86_64.tar.zst"
+          
+          rm -f "immortalwrt-imagebuilder-25.12.0-x86-64.Linux-x86_64.tar.zst"
+
+      - name: 🚚 同步并组合本地建筑材料
+        run: |
+          TARGET_DIR="/home/runner/immortalwrt_build/immortalwrt-imagebuilder-25.12.0-x86-64.Linux-x86_64"
+          
+          mkdir -p "$TARGET_DIR/files" "$TARGET_DIR/shell"
+          [ -d "${{ github.workspace }}/files" ] && cp -r ${{ github.workspace }}/files/* "$TARGET_DIR/files/" || true
+          [ -d "${{ github.workspace }}/shell" ] && cp -r ${{ github.workspace }}/shell/* "$TARGET_DIR/shell/" || true
+          
+          cp ${{ github.workspace }}/x86-64/build25.sh "$TARGET_DIR/build25.sh"
+          chmod +x "$TARGET_DIR/build25.sh"
+
+      - name: ✅ 纯原生运行：执行本地版编译脚本 (make image)
+        env:
+          PROFILE: ${{ github.event.inputs.profile }}
+          INCLUDE_DOCKER: ${{ github.event.inputs.include_docker }}
+          VERSION_INPUT: "25.12.0"
+        run: |
+          TARGET_DIR="/home/runner/immortalwrt_build/immortalwrt-imagebuilder-25.12.0-x86-64.Linux-x86_64"
+          cd "$TARGET_DIR"
+          ./build25.sh
+
+      - name: ✅ 精准拦截：提取唯一的 ext4-combined-efi.img.gz 到工作区
+        id: tag
+        run: |
+          TARGET_DIR="/home/runner/immortalwrt_build/immortalwrt-imagebuilder-25.12.0-x86-64.Linux-x86_64"
+          
+          # 准确定位并只把我们需要的 ext4-combined-efi 捞出来
+          find "$TARGET_DIR/bin/targets" -name "*ext4-combined-efi.img.gz" -exec cp {} ${{ github.workspace }}/ \;
+          
+          # 安全校验机制
+          if ls ${{ github.workspace }}/*ext4-combined-efi.img.gz 1>/dev/null 2>&1; then
+            echo "✅ 成功提取到唯一的 ext4 固件包！"
+            ls -lh ${{ github.workspace }}/*ext4-combined-efi.img.gz
+          else
+            echo "❌ 提取失败，未在输出目录中发现符合条件的 ext4 固件！"
+            exit 1
+          fi
+          
+          echo "release_tag=$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
+
+      - name: 🚀 自动发布 .img.gz 固件到 Releases 页面
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: "ImmortalWrt 25.12.0 EXT4 固件"
+          body: |
+            ## 🎉 固件原生云编译成功！
+            
+            - **文件系统类型**: `📦 EXT4 (支持在系统内直接自由扩容)`
+            - **网关默认静态 IP**: `192.168.15.15`
+          files: |
+            *ext4-combined-efi.img.gz
+          token: ${{ secrets.GITHUB_TOKEN }}
